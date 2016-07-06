@@ -1,0 +1,22 @@
+---
+## path to the log file.
+# log_file: None
+
+## one of debug, info, or warn
+# log_level: info
+
+## datetime format string for the log output
+# log_format: %Y.%m.%d-%H.%M.%S
+
+## list of tasks that each translate into a nice and long call to rsync.
+## each task is a dict with the following members recognized.
+##   src: <str>
+##     required, see SRC in rsync(1)
+##   dst: <str>
+##     required, see DST in rsync(1)
+##   rsync_path: <str>
+##     optional, value of --rsync-path, see rsync(1)
+##   exclude_from: <str>
+##     optional, utf-8 encoded contents of file passed to --exclude-from,
+##     see rsync(1)
+# tasks: []

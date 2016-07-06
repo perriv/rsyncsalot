@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import logging
+import os
+import os.path
+import pipes
+import shutil
+import subprocess
+import tempfile
+import threading
+import unittest
+
+import yaml
+
+__version__ = '0.0.1'
+
+BAK_FORMAT = '%Y.%m.%d-%H.%M.%S'
+
+def get_now():
+  '''Get the current datetime with only a second resolution.'''
+  now = datetime.datetime.today()
+
+  # Remove the microseconds from now, since datetimes formatted from
+  # backup_dirs are microsecon-unaware.
+  return now - datetime.timedelta(microseconds=now.microsecond)
+
+def prune_target(path):
+  try:
+    shutil.rmtree(path)
+  except BaseException as exc:
+    logging.warn('Pruning directory failed: %s', path)
+    logging.exception()
+  else:
+    logging.info('Pruned: %s', path)
+
+def prune(dst, now):
+  '''Prune the dst. Retention policy is as follows:
+      * 1 backup per year for all years preceding the current year
+      * 1 backup per month for all months preceding the current month
+      * 1 backup per day for all days in the current month preceding today
+      * Unlimited number of backups for today
+  '''
+
+  # Collect backup directories from previous days as datetimes
+  eligible_dts = []
+  today = datetime.datetime(now.year, now.month, now.day)
+  for d in os.listdir(dst):
+    try:
+      dt = datetime.datetime.strptime(d, BAK_FORMAT)
+    except ValueError:
+      logging.debug('Preserving %r', os.path.join(dst, d))
+      continue
+    if dt >= today:
+      logging.debug('Preserving %r', os.path.join(dst, d))
+      continue
+    eligible_dts.append(dt)
+
+  # Index datetimes by year, month, and day.
+  hashed_dts = {}
+  for dt in eligible_dts:
+    try:
+      hashed_dts[dt.year][dt.month][dt.day].append(dt)
+    except KeyError:
+      try:
+        hashed_dts[dt.year][dt.month][dt.day] = [dt]
+      except KeyError:
+        try:
+          hashed_dts[dt.year][dt.month] = {dt.day: [dt]}
+        except KeyError:
+          hashed_dts[dt.year] = {dt.month: {dt.day: [dt]}}
+
+  selected_dts = []
+  for year, year_dts in hashed_dts.items():
+    if year < now.year:
+      dts = sorted([dt
+          for month_dts in year_dts.values()
+              for day_dts in month_dts.values()
+                  for dt in day_dts])
+      keep_dt = dts.pop(0)
+      logging.debug('Preserving the oldest backup in year %r: %r',
+          year, os.path.join(dst, keep_dt.strftime(BAK_FORMAT)))
+      selected_dts.extend(dts)
+      continue
+
+    assert year == now.year
+    for month, month_dts in year_dts.items():
+      if month < now.month:
+        dts = sorted([dt for day_dts in month_dts.values() for dt in day_dts])
+        keep_dt = dts.pop(0)
+        logging.debug('Preserving the oldest backup in year %r month %r: %r',
+            year, month, os.path.join(keep_dt.strftime(BAK_FORMAT)))
+        selected_dts.extend(dts)
+        continue
+
+      assert month == now.month
+      for day, day_dts in month_dts.items():
+        assert day < now.day
+        dts = sorted(day_dts)
+        keep_dt = dts.pop(0)
+        logging.debug(
+            'Preserving the oldest backup in year %r month %r day %r: %r',
+            year, month, day, os.path.join(keep_dt.strftime(BAK_FORMAT)))
+        selected_dts.extend(dts)
+
+  threads = []
+  for dt in selected_dts:
+    d = os.path.join(dst, dt.strftime(BAK_FORMAT))
+    thread = threading.Thread(target=prune_target, args=(d,))
+    thread.start()
+    threads.append(thread)
+  for thread in threads:
+    thread.join()
+
+def rsync(src, dst, link_dest=None, exclude_from=None, rsync_path=None):
+  command = [
+      'rsync',
+      '--archive',
+      '--numeric-ids',
+      '--hard-links',
+      '--delete-after',
+      '--delete-excluded',
+  ]
+
+  if exclude_from is not None:
+    command.append('--exclude-from={}'.format(exclude_from))
+
+  if rsync_path is not None:
+    command.append('--rsync-path={}'.format(rsync_path))
+
+  if link_dest is not None:
+    command.append('--link-dest={}'.format(link_dest))
+
+  command.append(src)
+  command.append(dst)
+
+  logging.debug('Call: %r', command)
+  subprocess.check_call(command)
+  logging.debug('Done: %r', command)
+
+def main_task(task):
+  now = get_now()
+  now_str = now.strftime(BAK_FORMAT)
+  logging.debug('It is now %r %r', now, now_str)
+
+  rsync_src = task['src'] + '/'
+  rsync_dst = os.path.join(task['dst'], now_str)
+  rsync_rsync_path = task['rsync_path']
+
+  if os.path.exists(rsync_dst):
+    logging.debug('Backup already exists, overwriting sync: %r', rsync_dst)
+
+  # Create rsync_exclude_from, a temporary file storing exclude_from
+  rsync_exclude_from = None
+  if task['exclude_from'] is not None:
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+      logging.debug('Writing out exclude_from to %r', tf.name)
+      tf.write(task['exclude_from'].encode('utf-8'))
+      rsync_exclude_from = tf.name
+
+  # Find rsync_link_dest, the last backup directory to "link-dest" from
+  rsync_link_dest = None
+  last_dt = None
+  for d in os.listdir(task['dst']):
+    try:
+      dt = datetime.datetime.strptime(d, BAK_FORMAT)
+    except ValueError:
+      if d != 'latest':
+        logging.warn('Invalid backup directory in %s: %s', task['dst'], d)
+      continue
+    if dt >= now:
+      logging.warn('Invalid future backup directory in %s: %s', task['dst'], d)
+      continue
+    if last_dt is None or last_dt < dt:
+      last_dt = dt
+  if last_dt is not None:
+    logging.debug('Last dt in %r: %r', task['dst'], last_dt)
+    rsync_link_dest = os.path.join(task['dst'], last_dt.strftime(BAK_FORMAT))
+
+  rsync(
+    rsync_src,
+    rsync_dst,
+    link_dest=rsync_link_dest,
+    exclude_from=rsync_exclude_from,
+    rsync_path=rsync_rsync_path,
+  )
+
+  # Update the latest link
+  latest_link = os.path.join(task['dst'], 'latest')
+  if os.path.lexists(latest_link):
+    os.remove(latest_link)
+  os.symlink(now_str, latest_link)
+
+  prune(task['dst'], now)
+  return rsync_dst
+
+def main_task_target(task):
+  try:
+    dst = main_task(task)
+  except BaseException as exc:
+    logging.warn('Backing up directory failed: %s', task['src'])
+    logging.exception(str(exc))
+  else:
+    logging.info('Backed up: %s => %s', task['src'], dst)
+
+def main(config):
+  '''Entrypoint of script.'''
+
+  # If filename is None, logs will be sent to stderr.
+  logging.basicConfig(
+      filename=config['log_file'],
+      level=getattr(logging, config['log_level'].upper()),
+      datefmt='%Y.%m.%d-%H.%M.%S',
+      format='[%(asctime)s] %(levelname)s: %(funcName)s: %(message)s'
+  )
+
+  threads = []
+  for task in config['tasks']:
+    if not os.path.isdir(task['dst']):
+      logging.error('dst does not exist: {}'.format(task['dst']))
+      continue
+    thread = threading.Thread(target=main_task_target, args=(task,))
+    thread.start()
+    threads.append(thread)
+
+  for thread in threads:
+    thread.join()
+
+def load_config(path):
+  with open(path) as stream:
+    config = yaml.load(stream)
+
+  # Do basic sanity-checking on types and fill in defaults before returning
+  assert isinstance(config, dict)
+
+  config['log_file']   = config.get('log_file',   None)
+  config['log_level']  = config.get('log_level',  'info')
+  config['log_format'] = config.get('log_format', '%Y.%m.%d-%H.%M.%S')
+  config['tasks']      = config.get('tasks',      [])
+
+  assert config['log_file'] is None or isinstance(config['log_file'], str)
+  assert isinstance(config['log_level'],  str)
+  assert isinstance(config['log_format'], str)
+  assert isinstance(config['tasks'],      list)
+
+  for task in config['tasks']:
+    assert isinstance(task, dict)
+
+    task['rsync_path']   = task.get('rsync_path',   None)
+    task['exclude_from'] = task.get('exclude_from', None)
+
+    assert 'src' in task and isinstance(task['src'], str)
+    assert 'dst' in task and isinstance(task['dst'], str)
+    assert task['rsync_path']   is None or isinstance(task['rsync_path'],   str)
+    assert task['exclude_from'] is None or isinstance(task['exclude_from'], str)
+
+  return config
+
+class Tests(unittest.TestCase):
+  def setUp(self):
+    self.dst = tempfile.mkdtemp()
+    self.now = datetime.datetime(2016, 4, 13, 1, 2, 3)
+
+  def tearDown(self):
+    shutil.rmtree(self.dst)
+
+  def test_prune_no_backups_delete_none(self):
+    prune(self.dst, self.now)
+    self.assertEqual(os.listdir(self.dst), [])
+
+  def test_prune_many_backups_for_each_prev_year_month_day_delete_all_but_first(self):
+    dts = []
+    backups_kept = []
+
+    # Work with 729 == 3^6 backups
+    for year in (self.now.year - 2, self.now.year - 1, self.now.year):
+      for month in (self.now.month - 2, self.now.month - 1, self.now.month):
+        for day in (self.now.day - 2, self.now.day - 1, self.now.day):
+          for hour in (1, 2):
+            for minute in (1, 2):
+              for second in (1, 2):
+                dts.append(datetime.datetime(
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    second,
+                ))
+
+    # Keep the first one for each previous year
+    for year in (self.now.year - 2, self.now.year - 1):
+      backups_kept.append(datetime.datetime(
+          year,
+          self.now.month - 2,
+          self.now.day - 2,
+          1,
+          1,
+          1,
+      ).strftime(BAK_FORMAT))
+
+    # Keep the first one for each previous month of the current year
+    for month in (self.now.month - 2, self.now.month - 1):
+      backups_kept.append(datetime.datetime(
+          self.now.year,
+          month,
+          self.now.day - 2,
+          1,
+          1,
+          1,
+      ).strftime(BAK_FORMAT))
+
+    # Keep the first one for each previous day of the current year and month
+    for day in (self.now.day - 2, self.now.day - 1):
+      backups_kept.append(datetime.datetime(
+          self.now.year,
+          self.now.month,
+          day,
+          1,
+          1,
+          1,
+      ).strftime(BAK_FORMAT))
+
+    # Keep everything for today
+    for hour in (1, 2):
+      for minute in (1, 2):
+        for second in (1, 2):
+          backups_kept.append(datetime.datetime(
+              self.now.year,
+              self.now.month,
+              self.now.day,
+              hour,
+              minute,
+              second,
+          ).strftime(BAK_FORMAT))
+
+    for dt in dts:
+      os.mkdir(os.path.join(self.dst, dt.strftime(BAK_FORMAT)))
+    prune(self.dst, self.now)
+    self.assertEqual(sorted(os.listdir(self.dst)), sorted(backups_kept))
+
+  def test_prune_one_backup_for_each_prev_year_month_day_delete_none(self):
+    backups = []
+
+    for year in (self.now.year - 2, self.now.year - 1):
+      backups.append(datetime.datetime(
+          year,
+          self.now.month - 2,
+          self.now.day - 2,
+          1,
+          1,
+          1,
+      ).strftime(BAK_FORMAT))
+
+    for month in (self.now.month - 2, self.now.month - 1):
+      backups.append(datetime.datetime(
+          self.now.year,
+          month,
+          self.now.day - 2,
+          1,
+          1,
+          1,
+      ).strftime(BAK_FORMAT))
+
+    for day in (self.now.day - 2, self.now.day - 1):
+      backups.append(datetime.datetime(
+          self.now.year,
+          self.now.month,
+          day,
+          1,
+          1,
+          1,
+      ).strftime(BAK_FORMAT))
+
+    for hour in (1, 2):
+      for minute in (1, 2):
+        for second in (1, 2):
+          backups.append(datetime.datetime(
+              self.now.year,
+              self.now.month,
+              self.now.day,
+              hour,
+              minute,
+              second,
+          ).strftime(BAK_FORMAT))
+
+    for backup in backups:
+      os.mkdir(os.path.join(self.dst, backup))
+    prune(self.dst, self.now)
+    self.assertEqual(sorted(os.listdir(self.dst)), sorted(backups))
+
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser()
+  parser.add_argument('-v', '--version', action='version', version=__version__)
+  parser.add_argument('config')
+  args = parser.parse_args()
+  config = load_config(args.config)
+  main(config)
